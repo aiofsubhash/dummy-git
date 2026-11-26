@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# dummygit - switch GitHub profiles without the pain.
+# Configure each profile once. After that, activating one is a single command.
+#
+# Two separate things get switched, and they are kept separate on purpose:
+#   1. Commit identity  - the name/email stamped on your commits (git config user.*)
+#   2. Authentication   - how GitHub verifies you on push (gh CLI account or SSH key)
+# Switching only the first is cosmetic: your commits say "work" but you still
+# push as "personal". dummygit switches both.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+DG_DIR="${DUMMYGIT_DIR:-$HOME/.dummygit}"
+PROFILES_DIR="$DG_DIR/profiles"
+ACTIVE_FILE="$DG_DIR/active"
+SSH_MARKER="$DG_DIR/ssh-command"
+
+die() { printf 'dummygit: %s\n' "$*" >&2; exit 1; }
+need_git() { command -v git >/dev/null 2>&1 || die "git is not installed."; }
+
+profile_path() {
+  case "${1:-}" in
+    ""|*[!a-z0-9-]*) die "profile names use lowercase letters, numbers and dashes only: '${1:-}'" ;;
+  esac
+  printf '%s/%s.conf' "$PROFILES_DIR" "$1"
+}
+
+load_profile() {
+  local file
+  file="$(profile_path "$1")"
+  [ -f "$file" ] || die "no profile called '$1'. Create it: dummygit add $1"
+  GIT_NAME=""; GIT_EMAIL=""; GH_USER=""; SSH_KEY=""
+  # shellcheck disable=SC1090
+  . "$file"
+  [ -n "$GIT_NAME" ] && [ -n "$GIT_EMAIL" ] || die "profile '$1' is missing GIT_NAME or GIT_EMAIL. Edit: $file"
+}
+
+cmd_add() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    printf 'Profile name (e.g. personal, work): '
+    read -r name
+  fi
+  local file
+  file="$(profile_path "$name")"
+  [ -e "$file" ] && die "profile '$name' already exists. Remove it first: dummygit remove $name"
+  mkdir -p "$PROFILES_DIR"
+
+  printf 'Setting up profile "%s" (one time only).\n' "$name"
+  printf 'Git author name (shown on commits): '
+  read -r GIT_NAME
+  printf 'Git email for this account (GitHub matches commits by email): '
+  read -r GIT_EMAIL
+  [ -n "$GIT_NAME" ] && [ -n "$GIT_EMAIL" ] || die "name and email are required."
+
+  GH_USER=""; SSH_KEY=""
+  printf '\nHow should this profile authenticate to GitHub on push?\n'
+  printf '  1) GitHub CLI account (gh) - best for https remotes\n'
+  printf '  2) A dedicated SSH key     - best for git@github.com remotes\n'
+  printf '  3) Skip for now            - only commit identity will switch\n'
+  printf 'Pick [1/2/3]: '
+  read -r auth
+  case "$auth" in
+    1)
+      command -v gh >/dev/null 2>&1 || die "GitHub CLI (gh) is not installed. Install it from cli.github.com, or pick 2."
+      printf 'GitHub username for this profile: '
+      read -r GH_USER
+      [ -n "$GH_USER" ] || die "username is required for gh switching."
+      ;;
+    2)
+      local default_key="$HOME/.ssh/id_ed25519_$name"
+      printf 'SSH private key path [%s]: ' "$default_key"
+      read -r SSH_KEY
+      SSH_KEY="${SSH_KEY:-$default_key}"
+      SSH_KEY="${SSH_KEY/#\~/$HOME}"
+      if [ ! -f "$SSH_KEY" ]; then
+        printf 'No key at %s. Generate one now? [Y/n] ' "$SSH_KEY"
+        read -r gen
+        case "$gen" in
+          n|N) die "key not found; profile not saved." ;;
+          *)
+            mkdir -p "$HOME/.ssh"
+            ssh-keygen -t ed25519 -C "$GIT_EMAIL" -f "$SSH_KEY" -N "" >/dev/null || die "ssh-keygen failed."
+            printf '\nNew key created. Add this PUBLIC key to the "%s" GitHub account\n' "$name"
+            printf '(github.com -> Settings -> SSH and GPG keys -> New SSH key):\n\n'
+            cat "$SSH_KEY.pub"
+            printf '\n\n'
+            ;;
+        esac
+      fi
+      ;;
+    3) ;;
+    *) die "pick 1, 2 or 3." ;;
+  esac
+
+  {
+    printf 'GIT_NAME=%q\n' "$GIT_NAME"
+    printf 'GIT_EMAIL=%q\n' "$GIT_EMAIL"
+    printf 'GH_USER=%q\n' "$GH_USER"
+    printf 'SSH_KEY=%q\n' "$SSH_KEY"
+  } > "$file"
+  printf '\nProfile "%s" saved.\n' "$name"
+
+  printf 'Activate it now? [Y/n] '
+  read -r now
+  case "$now" in
+    n|N) printf 'Later: dummygit use %s\n' "$name" ;;
+    *) cmd_use "$name" ;;
+  esac
+}
+
+cmd_use() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: dummygit use <profile>"
+  need_git
+  load_profile "$name"
+
+  # 1. Commit identity
+  git config --global user.name "$GIT_NAME"
+  git config --global user.email "$GIT_EMAIL"
+
+  # 2. Authentication (separate from identity, on purpose)
+  if [ -n "$SSH_KEY" ]; then
+    [ -f "$SSH_KEY" ] || die "profile '$name' expects SSH key $SSH_KEY but it does not exist."
+    local sshcmd="ssh -i $SSH_KEY -o IdentitiesOnly=yes"
+    git config --global core.sshCommand "$sshcmd"
+    printf '%s\n' "$sshcmd" > "$SSH_MARKER"
+  else
+    # Remove core.sshCommand only if dummygit itself set it; never clobber a
+    # value the user configured by hand.
+    if [ -f "$SSH_MARKER" ]; then
+      local cur
+      cur="$(git config --global --get core.sshCommand 2>/dev/null || true)"
+      if [ "$cur" = "$(cat "$SSH_MARKER")" ]; then
+        git config --global --unset core.sshCommand
+      fi
+      rm -f "$SSH_MARKER"
+    fi
+  fi
+
+  if [ -n "$GH_USER" ]; then
+    if command -v gh >/dev/null 2>&1; then
+      local out
+      if out="$(gh auth switch --user "$GH_USER" 2>&1)"; then
+        gh auth setup-git >/dev/null 2>&1 || true
+      else
+        printf 'Note: gh could not switch to "%s". Log in once with: gh auth login\n' "$GH_USER" >&2
+      fi
+    else
+      printf 'Note: gh is not installed; authentication left unchanged.\n' >&2
+    fi
+  fi
+
+  printf '%s\n' "$name" > "$ACTIVE_FILE"
+  printf 'Active profile: %s\n' "$name"
+  printf '  commits as: %s <%s>\n' "$GIT_NAME" "$GIT_EMAIL"
+  if [ -n "$SSH_KEY" ]; then
+    printf '  pushes via: SSH key %s\n' "$SSH_KEY"
+  elif [ -n "$GH_USER" ]; then
+    printf '  pushes via: gh account %s\n' "$GH_USER"
+  else
+    printf '  pushes via: unchanged (no auth method configured for this profile)\n'
+  fi
+}
+
+cmd_list() {
+  local active=""
+  [ -f "$ACTIVE_FILE" ] && active="$(cat "$ACTIVE_FILE")"
+  local found=0 f p mark
+  for f in "$PROFILES_DIR"/*.conf; do
+    [ -e "$f" ] || continue
+    found=1
+    p="$(basename "$f" .conf)"
+    mark=" "
+    [ "$p" = "$active" ] && mark="*"
+    GIT_NAME=""; GIT_EMAIL=""; GH_USER=""; SSH_KEY=""
+    # shellcheck disable=SC1090
+    . "$f"
+    printf '%s %-12s %s <%s>\n' "$mark" "$p" "$GIT_NAME" "$GIT_EMAIL"
+  done
+  [ "$found" -eq 1 ] || printf 'No profiles yet. Add one: dummygit add personal\n'
+}
+
+cmd_status() {
+  need_git
+  local active="(none)"
+  [ -f "$ACTIVE_FILE" ] && active="$(cat "$ACTIVE_FILE")"
+  printf 'dummygit active profile: %s\n' "$active"
+  printf 'git identity:  %s <%s>\n' "$(git config --global --get user.name || true)" "$(git config --global --get user.email || true)"
+  local sshcmd
+  sshcmd="$(git config --global --get core.sshCommand 2>/dev/null || true)"
+  if [ -n "$sshcmd" ]; then
+    printf 'ssh auth:      %s\n' "$sshcmd"
+  else
+    printf 'ssh auth:      (default ssh behavior)\n'
+  fi
+  if command -v gh >/dev/null 2>&1; then
+    printf 'gh accounts:\n'
+    gh auth status 2>&1 | sed 's/^/  /' || true
+  else
+    printf 'gh accounts:   (gh not installed)\n'
+  fi
+}
+
+cmd_pick() {
+  local profiles=() f
+  for f in "$PROFILES_DIR"/*.conf; do
+    [ -e "$f" ] || continue
+    profiles+=("$(basename "$f" .conf)")
+  done
+  [ "${#profiles[@]}" -gt 0 ] || die "no profiles yet. Add one: dummygit add personal"
+  local active=""
+  [ -f "$ACTIVE_FILE" ] && active="$(cat "$ACTIVE_FILE")"
+  printf 'Which profile?\n'
+  local i p mark
+  for i in "${!profiles[@]}"; do
+    p="${profiles[$i]}"
+    mark=" "
+    [ "$p" = "$active" ] && mark="*"
+    printf '  %d) %s %s\n' "$((i + 1))" "$mark" "$p"
+  done
+  printf 'Pick a number: '
+  local pick
+  read -r pick
+  case "$pick" in
+    ''|*[!0-9]*) die "not a number." ;;
+  esac
+  [ "$pick" -ge 1 ] && [ "$pick" -le "${#profiles[@]}" ] || die "out of range."
+  cmd_use "${profiles[$((pick - 1))]}"
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: dummygit remove <profile>"
+  local file
+  file="$(profile_path "$name")"
+  [ -f "$file" ] || die "no profile called '$name'."
+  rm -f "$file"
+  if [ -f "$ACTIVE_FILE" ] && [ "$(cat "$ACTIVE_FILE")" = "$name" ]; then
+    rm -f "$ACTIVE_FILE"
+  fi
+  printf 'Removed profile "%s". Your current git config was left as-is.\n' "$name"
+}
+
+cmd_help() {
+  cat <<'EOF'
+dummygit - dead-simple GitHub profile switching.
+
+One-time setup per profile:
+  dummygit add personal
+  dummygit add work
+
+Every time after that (this is the whole point):
+  dummygit              pick from a list, hit a number, done
+  dummygit use work     or name it directly
+
+Other commands:
+  dummygit list         show profiles (* = active)
+  dummygit status       show current identity + authentication
+  dummygit remove work  delete a profile
+  dummygit help         this text
+
+What "activate" switches:
+  1. Commit identity  - git config user.name / user.email
+  2. Authentication   - gh CLI account (gh auth switch) or a dedicated
+                        SSH key (core.sshCommand), depending on the profile
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    "")        cmd_pick ;;
+    add)       shift; cmd_add "${@}" ;;
+    use)       shift; cmd_use "${@}" ;;
+    list|ls)   cmd_list ;;
+    status)    cmd_status ;;
+    remove|rm) shift; cmd_remove "${@}" ;;
+    help|-h|--help) cmd_help ;;
+    version|--version) printf 'dummygit %s\n' "$VERSION" ;;
+    *) die "unknown command: $cmd (try: dummygit help)" ;;
+  esac
+}
+
+main "$@"
