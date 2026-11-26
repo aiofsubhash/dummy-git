@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 DG_DIR="${DUMMYGIT_DIR:-$HOME/.dummygit}"
 PROFILES_DIR="$DG_DIR/profiles"
 ACTIVE_FILE="$DG_DIR/active"
@@ -64,9 +64,13 @@ check_credential_helpers() {
   esac
   if [ -n "$h" ] && ! printf '%s\n' "$h" | grep -q 'gh auth git-credential'; then
     warn "git credential.helper is '$h', not GitHub CLI."
-    warn "  Stored https credentials may still push as the old account."
-    warn "  Fix once: gh auth setup-git   (then remove stale entries from your helper)"
+    warn "  Stored https credentials would still push as the old account even"
+    warn "  after gh auth switch. Fix once:"
+    warn "    gh auth setup-git"
+    warn "    then remove stale github.com entries from '$h'."
+    return 1
   fi
+  return 0
 }
 
 check_ssh_config() {
@@ -76,9 +80,12 @@ check_ssh_config() {
   [ -f "$cfg" ] || return 0
   if awk '/^[Hh]ost /{inblk=0; for(i=2;i<=NF;i++) if($i=="github.com") inblk=1; next} inblk && /^[[:space:]]*[Ii]dentity[Ff]ile/{found=1} END{exit !found}' "$cfg" 2>/dev/null; then
     warn "~/.ssh/config has an IdentityFile for Host github.com."
-    warn "  It competes with dummygit's key switching. Cleanest fix: remove that"
-    warn "  IdentityFile line and let each dummygit profile carry its own key."
+    warn "  It competes with dummygit's key switching and can silently auth as"
+    warn "  the wrong account. Fix: remove that IdentityFile line and let each"
+    warn "  dummygit profile carry its own key."
+    return 1
   fi
+  return 0
 }
 
 check_repo_overrides() {
@@ -88,9 +95,11 @@ check_repo_overrides() {
   le="$(git config --local --get user.email 2>/dev/null || true)"
   ln="$(git config --local --get user.name 2>/dev/null || true)"
   ls="$(git config --local --get core.sshCommand 2>/dev/null || true)"
+  local conflict=0
   if [ -n "$le" ] || [ -n "$ln" ] || [ -n "$ls" ]; then
-    warn "this repo has its OWN local git config (user.name/user.email/core.sshCommand)."
-    warn "  Local config beats the global switch for this repo:"
+    conflict=1
+    warn "this repo has its OWN local git config - the global switch does NOT"
+    warn "  apply here:"
     [ -n "$ln" ] && warn "    local user.name = $ln"
     [ -n "$le" ] && warn "    local user.email = $le"
     [ -n "$ls" ] && warn "    local core.sshCommand = $ls"
@@ -99,21 +108,48 @@ check_repo_overrides() {
   local url
   url="$(git config --local --get remote.origin.url 2>/dev/null || true)"
   case "$url" in
-    https://*@*) warn "remote URL embeds credentials; it ignores profile switching: $url" ;;
+    https://*@*) conflict=1; warn "remote URL embeds credentials; it ignores profile switching: $url" ;;
   esac
+  return $conflict
 }
 
-run_guards() {
-  local gh_user="${1:-}" ssh_key="${2:-}"
-  [ -n "$gh_user" ] && check_credential_helpers
-  [ -n "$ssh_key" ] && check_ssh_config
-  check_repo_overrides
+# Pre-flight: conflicts that would defeat the switch block activation entirely.
+preflight() {
+  local gh_user="${1:-}" ssh_key="${2:-}" blocked=0
+  if [ -n "$gh_user" ]; then
+    check_credential_helpers || blocked=1
+  fi
+  if [ -n "$ssh_key" ]; then
+    check_ssh_config || blocked=1
+  fi
+  return $blocked
 }
 
 run_all_guards() {
-  check_credential_helpers
-  check_ssh_config
-  check_repo_overrides
+  local conflicts=0
+  check_credential_helpers || conflicts=$((conflicts + 1))
+  check_ssh_config || conflicts=$((conflicts + 1))
+  check_repo_overrides || conflicts=$((conflicts + 1))
+  return $conflicts
+}
+
+# Snapshot what activation is about to change, for `dummygit undo`.
+# Scope note: this covers git config only. gh-side state (gh auth switch,
+# gh auth setup-git) is gh's own and is not snapshotted.
+snapshot_state() {
+  mkdir -p "$DG_DIR"
+  local name email sshcmd active
+  name="$(git config --global --get user.name 2>/dev/null || printf '%s' '__UNSET__')"
+  email="$(git config --global --get user.email 2>/dev/null || printf '%s' '__UNSET__')"
+  sshcmd="$(git config --global --get core.sshCommand 2>/dev/null || printf '%s' '__UNSET__')"
+  active=""
+  [ -f "$ACTIVE_FILE" ] && active="$(cat "$ACTIVE_FILE")"
+  {
+    printf 'PREV_NAME=%q\n' "$name"
+    printf 'PREV_EMAIL=%q\n' "$email"
+    printf 'PREV_SSHCMD=%q\n' "$sshcmd"
+    printf 'PREV_ACTIVE=%q\n' "$active"
+  } > "$DG_DIR/previous.conf"
 }
 
 # ---------------------------------------------------------------- commands
@@ -198,6 +234,15 @@ cmd_use() {
   need_git
   load_profile "$name"
 
+  # Pre-flight: if existing config would defeat this switch, change nothing.
+  if ! preflight "$GH_USER" "$SSH_KEY"; then
+    die "activation BLOCKED. Fix the conflicts above, then run: dummygit use $name
+Nothing was changed. Profile '$name' is NOT active."
+  fi
+
+  # Remember what we are about to change, for `dummygit undo`.
+  snapshot_state
+
   # 1. Commit identity
   git config --global user.name "$GIT_NAME"
   git config --global user.email "$GIT_EMAIL"
@@ -225,7 +270,9 @@ cmd_use() {
     if command -v gh >/dev/null 2>&1; then
       local out
       if out="$(gh auth switch --user "$GH_USER" 2>&1)"; then
-        # Make git-over-https ask gh for credentials, host-scoped.
+        # NOTE: this WRITES global git config (host-scoped credential helper
+        # for github.com). Without it, git-over-https keeps using whatever
+        # credentials were stored before, so the switch would be cosmetic.
         gh auth setup-git >/dev/null 2>&1 || true
       else
         warn "gh could not switch to \"$GH_USER\". Log in once with: gh auth login"
@@ -245,7 +292,59 @@ cmd_use() {
   else
     printf '  pushes via: unchanged (no auth method configured for this profile)\n'
   fi
-  run_guards "$GH_USER" "$SSH_KEY"
+  printf '  (reverse the git config part with: dummygit undo)\n'
+
+  # Repo-local config beats the global switch. Say so loudly, and exit nonzero
+  # so scripts see the activation did not fully take.
+  if ! check_repo_overrides; then
+    printf '\nNOT ACTIVE IN THIS REPO (%s): local overrides above win here.\n' "$(git rev-parse --show-toplevel 2>/dev/null)" >&2
+    printf 'Global profile "%s" is active everywhere else.\n' "$name" >&2
+    return 2
+  fi
+}
+
+cmd_undo() {
+  need_git
+  local f="$DG_DIR/previous.conf"
+  [ -f "$f" ] || die "nothing to undo (no previous state recorded)."
+  PREV_NAME=""; PREV_EMAIL=""; PREV_SSHCMD=""; PREV_ACTIVE=""
+  # shellcheck disable=SC1090
+  . "$f"
+
+  restore_key() {
+    # $1 = git config key, $2 = saved value or __UNSET__
+    if [ "$2" = "__UNSET__" ]; then
+      case "$1" in
+        core.sshCommand)
+          # unset only if the current value is one dummygit set
+          if [ -f "$SSH_MARKER" ] && [ "$(git config --global --get core.sshCommand 2>/dev/null || true)" = "$(cat "$SSH_MARKER")" ]; then
+            git config --global --unset core.sshCommand
+          fi
+          rm -f "$SSH_MARKER"
+          ;;
+        *)
+          git config --global --unset "$1" 2>/dev/null || true
+          ;;
+      esac
+    else
+      git config --global "$1" "$2"
+      if [ "$1" = "core.sshCommand" ]; then rm -f "$SSH_MARKER"; fi
+    fi
+  }
+
+  restore_key user.name "$PREV_NAME"
+  restore_key user.email "$PREV_EMAIL"
+  restore_key core.sshCommand "$PREV_SSHCMD"
+
+  if [ -n "$PREV_ACTIVE" ]; then
+    printf '%s\n' "$PREV_ACTIVE" > "$ACTIVE_FILE"
+  else
+    rm -f "$ACTIVE_FILE"
+  fi
+  rm -f "$f"
+  printf 'Undone. Restored git identity: %s <%s>\n' "$PREV_NAME" "$PREV_EMAIL"
+  printf 'Note: gh-side state (gh auth switch / setup-git) is not reversed by undo;\n'
+  printf 'use gh auth switch --user <other> to flip gh back.\n'
 }
 
 cmd_list() {
@@ -288,8 +387,12 @@ cmd_status() {
 cmd_doctor() {
   need_git
   printf 'dummygit doctor - checking for config that can defeat switching\n\n'
-  run_all_guards
-  printf '\nDone. No output above a section means nothing conflicting found.\n'
+  if run_all_guards; then
+    printf '\nNo conflicts found.\n'
+  else
+    printf '\nConflicts found (see above). These block or weaken activation.\n'
+    return 1
+  fi
 }
 
 cmd_remove() {
@@ -389,16 +492,20 @@ Every time after that (this is the whole point):
 Other commands:
   dummygit list         show profiles (* = active)
   dummygit status       show current identity + authentication
-  dummygit doctor       check for config that can silently defeat a switch
-                        (stale credential helpers, ~/.ssh/config github.com
-                        host blocks, repo-local overrides)
+  dummygit doctor       check for config that can defeat a switch
+  dummygit undo         restore the git config from before the last activation
   dummygit remove work  delete a profile
   dummygit help         this text
 
-What "activate" switches:
-  1. Commit identity  - git config user.name / user.email
-  2. Authentication   - gh CLI account (gh auth switch + gh auth setup-git)
-                        or a dedicated SSH key (core.sshCommand)
+What "activate" changes:
+  1. Commit identity  - global git config user.name / user.email
+  2. Authentication   - gh CLI account (gh auth switch) AND global git
+                        credential config (gh auth setup-git), or a dedicated
+                        SSH key (global core.sshCommand)
+  Activation BLOCKS (nothing changed) if existing config would defeat the
+  switch: a non-gh credential.helper, or an IdentityFile for github.com in
+  ~/.ssh/config. A repo with local overrides activates globally but reports
+  NOT ACTIVE IN THIS REPO and exits nonzero.
 EOF
 }
 
@@ -415,6 +522,7 @@ main() {
     list|ls)   cmd_list ;;
     status)    cmd_status ;;
     doctor)    cmd_doctor ;;
+    undo)      cmd_undo ;;
     remove|rm) shift; cmd_remove "$@" ;;
     help|-h|--help) cmd_help ;;
     version|--version) printf 'dummygit %s\n' "$VERSION" ;;

@@ -10,7 +10,7 @@ and activation as close to one click as possible. He named it himself: "Dummy
 Git". Keep the name. Keep the product simple - simplicity is the feature.
 
 Repo: github.com/aiofsubhash/dummy-git (public). Subhash is a collaborator;
-aiofsubhash is Instinct's own GitHub account. Instinct (this author) built it.
+aiofsubhash is Instinct's own GitHub account. Instinct (this author) built it; v0.3 came via PR #1 (instinct/blocking-guards), the first change to follow the branch+PR rule - v0.1/v0.2 went straight to main before the rule was applied here; that history stays as-is.
 
 ## Design decisions (don't regress these)
 
@@ -23,24 +23,31 @@ aiofsubhash is Instinct's own GitHub account. Instinct (this author) built it.
    Bash) and falls back to a terminal number picker when there is no display.
    `dummygit use <name>` stays for scripts. v0.1 was terminal-only; that did
    not meet the ask.
-3. **SSH auth uses `core.sshCommand`, not `~/.ssh/config` host aliases.** One
+3. **A switch that would not take must not pretend to take.** Pre-flight
+   guards BLOCK activation (exit 1, zero changes, profile not marked active)
+   when existing config would defeat it: non-gh credential.helper, or an
+   IdentityFile for github.com in ~/.ssh/config. Repo-local overrides cannot
+   be "fixed" globally, so there the global switch completes but the tool
+   prints NOT ACTIVE IN THIS REPO and exits 2. Warn-then-mark-active was the
+   v0.2 behavior; it was wrong.
+4. **SSH auth uses `core.sshCommand`, not `~/.ssh/config` host aliases.** One
    global setting, no per-repo remote rewrites, easy to unset. dummygit records
    what it set in `~/.dummygit/ssh-command` and only ever unsets a value it set
    itself - never clobber a hand-configured `core.sshCommand`.
-4. **gh auth uses `gh auth switch --user` PLUS `gh auth setup-git`.** The
-   switch alone does not make git-over-https use the new account; setup-git
-   registers gh as the host credential helper. Both accounts must be logged in
-   (`gh auth login` once each); the tool says so instead of failing weirdly.
-5. **Guards, not rewrites.** `run_guards` (on every `use`, and standalone as
-   `dummygit doctor`) warns about the three ways a switch gets silently
-   defeated: a non-gh credential.helper serving stale https credentials, an
-   IdentityFile under `Host github.com` in ~/.ssh/config, and repo-local
-   config overriding the global switch. It warns with the exact fix; it never
-   edits config it does not own. Keep it that way.
-6. **Single dependency-free bash file.** Profiles are plain KEY=VALUE files in
+5. **gh auth uses `gh auth switch --user` PLUS `gh auth setup-git`, and the
+   README says so honestly: setup-git WRITES global git config (host-scoped
+   credential helper for github.com). It is a deliberate global auth change,
+   not a side effect to hide. Both accounts must be logged in (`gh auth login`
+   once each); the tool says so instead of failing weirdly.
+6. **Snapshot before changing.** Every activation that passes pre-flight
+   writes ~/.dummygit/previous.conf (identity, core.sshCommand, active
+   profile) first; `dummygit undo` restores it. Undo covers git config only -
+   gh-side state is not reversed (documented). Pre-flight guards and undo
+   never edit config dummygit does not own.
+7. **Single dependency-free bash file.** Profiles are plain KEY=VALUE files in
    `~/.dummygit/profiles/` (written with printf %q, sourced back - keep that
    quoting intact). GUI tools are used only if already installed.
-7. **Global switching, not per-repo.** Deliberate for v1: matches how Subhash
+8. **Global switching, not per-repo.** Deliberate for v1: matches how Subhash
    described the pain ("get into work GitHub mode, later get into personal
    mode"). Per-repo is a listed next step, not a silent behavior change.
 
@@ -60,8 +67,14 @@ trim the README to lead with it.
 - bare `dummygit`: opens the real zenity dialog under Xvfb; a scripted click
   (xdotool) on "work" + OK activated the work profile end to end; with no
   DISPLAY it falls back to the terminal picker
-- guards fire: credential.helper=store warning, ~/.ssh/config Host github.com
-  IdentityFile warning, repo-local user.email warning (with values shown)
+- BLOCKING (v0.3): credential.helper=store blocks a gh-profile activation -
+  exit 1, git config byte-identical, profile not marked active; ssh-config
+  IdentityFile blocks an ssh-profile activation the same way; repo-local
+  override lets the global switch through but exits 2 and prints NOT ACTIVE
+  IN THIS REPO
+- undo (v0.3): after personal -> work, restores name/email/core.sshCommand and
+  active profile; second undo errors cleanly; a contaminated-sequence trace
+  was re-run clean to confirm exact restore values
 - real `git commit` in a scratch repo picks up the switched author identity
 - error paths: unknown profile, bad profile name, missing SSH key, `gui` with
   no dialog tool errors with the fallback hint

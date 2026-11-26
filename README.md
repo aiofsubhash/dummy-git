@@ -42,8 +42,9 @@ things, and mixing them up is why profile switching feels broken:
 
 Changing only the first is cosmetic: your commits say "work" but you still push
 as "personal" (or get permission denied). Dummy Git switches **both** every
-time, and it warns you about config that can silently defeat the switch
-(stale credential helpers, `~/.ssh/config` host blocks, repo-local overrides).
+time. And if existing config on your machine would silently defeat the switch
+(a stale credential helper, an `~/.ssh/config` host block), activation
+**blocks and changes nothing** instead of pretending it worked.
 
 ## Install
 
@@ -92,21 +93,44 @@ dummygit use work   # or name it directly, no prompt
 | `dummygit gui` | Force the click dialog (errors if none available) |
 | `dummygit list` | Show profiles (`*` = active) |
 | `dummygit status` | Current identity, SSH command, gh accounts |
-| `dummygit doctor` | Check for config that can silently defeat a switch |
+| `dummygit doctor` | Check for config that can defeat a switch |
+| `dummygit undo` | Restore the git config from before the last activation |
 | `dummygit remove work` | Delete a profile (your git config stays as-is) |
 | `dummygit help` | Help |
 
-## What can still go wrong (dummygit warns, never silently rewrites)
+## Exactly what activation changes (and what it never touches)
 
-- A non-gh `credential.helper` (like `store` or a keychain helper) can keep
-  serving the *old* account's https credentials after `gh auth switch`.
-- An `IdentityFile` under `Host github.com` in `~/.ssh/config` competes with
-  per-profile SSH keys.
-- A repo's **local** config (`user.email`, `core.sshCommand`, a remote URL with
-  embedded credentials) beats the global switch for that repo.
+- **Global git identity**: `user.name`, `user.email` in `~/.gitconfig`.
+- **One of two auth paths**:
+  - gh profile: `gh auth switch --user` (gh's own state) **and**
+    `gh auth setup-git`, which *does* write global git config - it registers
+    gh as the credential helper for `https://github.com`. That write is the
+    point: without it, https pushes keep using stale stored credentials.
+  - SSH profile: global `core.sshCommand` set to the profile's key.
+- **Before changing anything**, dummygit snapshots the current identity,
+  `core.sshCommand` and active profile to `~/.dummygit/previous.conf`.
+  `dummygit undo` restores them. (Undo covers git config only; flip gh back
+  with `gh auth switch --user <other>`.)
+- **Never touched**: a `core.sshCommand` or credential helper that dummygit
+  didn't set, repo-local config, your `~/.ssh/config`, your remotes.
 
-Run `dummygit doctor` any time; activation also checks these and tells you the
-exact fix.
+## When activation refuses to run
+
+Activation **blocks** (exit 1, nothing changed, profile NOT activated) when
+existing config would defeat the switch:
+
+- a non-gh `credential.helper` (like `store` or a keychain helper) that would
+  keep serving the *old* account's https credentials - fix once with
+  `gh auth setup-git` and clear the stale entries;
+- an `IdentityFile` under `Host github.com` in `~/.ssh/config` that competes
+  with per-profile keys - remove it and let each profile carry its key.
+
+And if you activate while standing in a repo that has its **own** local
+`user.email` / `core.sshCommand` / credential-embedded remote, the global
+switch completes but dummygit prints `NOT ACTIVE IN THIS REPO` and exits 2,
+because local config wins there.
+
+`dummygit doctor` runs all of these checks any time.
 
 ## Notes and limits
 
@@ -115,5 +139,7 @@ exact fix.
   you configured by hand is left alone.
 - Switching is global (your whole machine), not per-repo. Per-repo profiles are
   a possible next step.
-- Tested on Linux bash (zenity GUI included). macOS (osascript) and Windows
-  (PowerShell) dialogs are implemented but not yet tested on real machines.
+- Tested on Linux bash: zenity GUI end-to-end (scripted click), blocking
+  guards, undo, terminal fallback. macOS (osascript) and Windows (PowerShell)
+  dialogs are implemented but not yet tested on real machines. Warnings print
+  to the terminal, so a GUI launched outside a terminal shows no guard output.
