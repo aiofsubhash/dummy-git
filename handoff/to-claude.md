@@ -10,7 +10,7 @@ and activation as close to one click as possible. He named it himself: "Dummy
 Git". Keep the name. Keep the product simple - simplicity is the feature.
 
 Repo: github.com/aiofsubhash/dummy-git (public). Subhash is a collaborator;
-aiofsubhash is Instinct's own GitHub account. Instinct (this author) built v1.
+aiofsubhash is Instinct's own GitHub account. Instinct (this author) built it.
 
 ## Design decisions (don't regress these)
 
@@ -18,49 +18,72 @@ aiofsubhash is Instinct's own GitHub account. Instinct (this author) built v1.
    switched.** `user.name`/`user.email` alone is cosmetic - pushes still go
    through whatever account is authenticated. Every activation sets the git
    identity AND flips auth (gh account or SSH key).
-2. **SSH auth uses `core.sshCommand`, not `~/.ssh/config` host aliases.** One
+2. **Activation must be a click.** Bare `dummygit` opens a GUI picker
+   (osascript on macOS, zenity/kdialog on Linux, PowerShell on Windows Git
+   Bash) and falls back to a terminal number picker when there is no display.
+   `dummygit use <name>` stays for scripts. v0.1 was terminal-only; that did
+   not meet the ask.
+3. **SSH auth uses `core.sshCommand`, not `~/.ssh/config` host aliases.** One
    global setting, no per-repo remote rewrites, easy to unset. dummygit records
    what it set in `~/.dummygit/ssh-command` and only ever unsets a value it set
    itself - never clobber a hand-configured `core.sshCommand`.
-3. **gh auth uses `gh auth switch --user`, plus one-time `gh auth setup-git`.**
-   Requires both accounts logged in via `gh auth login` beforehand; the tool
-   says so when that is missing instead of failing weirdly.
-4. **Single dependency-free bash file.** No python, no node, no brew formula.
-   Profiles are plain KEY=VALUE files in `~/.dummygit/profiles/` (written with
-   printf %q, sourced back - keep that quoting intact).
-5. **Global switching, not per-repo.** Deliberate for v1: matches how Subhash
+4. **gh auth uses `gh auth switch --user` PLUS `gh auth setup-git`.** The
+   switch alone does not make git-over-https use the new account; setup-git
+   registers gh as the host credential helper. Both accounts must be logged in
+   (`gh auth login` once each); the tool says so instead of failing weirdly.
+5. **Guards, not rewrites.** `run_guards` (on every `use`, and standalone as
+   `dummygit doctor`) warns about the three ways a switch gets silently
+   defeated: a non-gh credential.helper serving stale https credentials, an
+   IdentityFile under `Host github.com` in ~/.ssh/config, and repo-local
+   config overriding the global switch. It warns with the exact fix; it never
+   edits config it does not own. Keep it that way.
+6. **Single dependency-free bash file.** Profiles are plain KEY=VALUE files in
+   `~/.dummygit/profiles/` (written with printf %q, sourced back - keep that
+   quoting intact). GUI tools are used only if already installed.
+7. **Global switching, not per-repo.** Deliberate for v1: matches how Subhash
    described the pain ("get into work GitHub mode, later get into personal
-   mode"). Per-repo is listed as a next step, not a silent behavior change.
+   mode"). Per-repo is a listed next step, not a silent behavior change.
 
-## What is tested (by Instinct, in a sandbox HOME, Nov 27 2026)
+## Platform
 
-- `add` for both auth paths (SSH key with generation, gh account), via piped stdin
+His desktop OS is not on record. Circumstantial evidence points to macOS (he
+built paceyouradhd.com as a Mac app and said it "excludes out windows users",
+Sep 24 2026). The GUI covers macOS/Linux/Windows anyway. If he confirms one,
+trim the README to lead with it.
+
+## What is tested (by Instinct, sandbox HOME + xvfb, Nov 27 2026)
+
+- `add` both auth paths (SSH key with real ssh-keygen generation, gh account)
 - `use` switches user.name/user.email; sets and later cleanly unsets
-  `core.sshCommand` when moving from an SSH profile to a gh profile
+  `core.sshCommand` moving SSH -> gh profile
 - `use` does NOT unset a hand-set `core.sshCommand` that dummygit didn't write
-- interactive no-arg picker (`dummygit` then a number) activates the right profile
-- `list` marks the active profile; `remove` deletes it and clears `active`
+- bare `dummygit`: opens the real zenity dialog under Xvfb; a scripted click
+  (xdotool) on "work" + OK activated the work profile end to end; with no
+  DISPLAY it falls back to the terminal picker
+- guards fire: credential.helper=store warning, ~/.ssh/config Host github.com
+  IdentityFile warning, repo-local user.email warning (with values shown)
 - real `git commit` in a scratch repo picks up the switched author identity
-- error paths: unknown profile, bad profile name, missing SSH key
+- error paths: unknown profile, bad profile name, missing SSH key, `gui` with
+  no dialog tool errors with the fallback hint
 
-Not tested: real `gh auth switch` between two live GitHub accounts (needs two
-logged-in accounts on a real machine), Windows/Git Bash, zsh interaction
-(the script is bash-only; that is fine - it runs under bash regardless of
-login shell).
+Not tested: real `gh auth switch` between two live GitHub accounts (needs his
+machine with both logged in), the osascript dialog on a real Mac, the
+PowerShell dialog on real Windows, zsh login-shell interaction (the script is
+bash-only regardless).
 
 ## Next steps Subhash may ask for (in likely order)
 
 1. Per-repo profiles: `dummygit use work --here` writing to the repo's local
    config instead of `--global`.
-2. `dummygit add` non-interactive flags for scripting.
-3. Shell completions (bash/zsh/fish).
-4. Windows native support (PowerShell port or confirm Git Bash works).
-5. `brew`/`apt` packaging if he wants to share it publicly.
+2. A persistent app shortcut (macOS .app / .desktop file) so he never opens a
+   terminal at all.
+3. `dummygit add` non-interactive flags for scripting.
+4. Shell completions (bash/zsh/fish).
+5. brew/apt packaging if he shares it publicly.
 
 ## Working agreement
 
 - Work on a branch, open a PR, don't push straight to main.
 - Public repo: no secrets, no emails beyond what Subhash already publishes,
   no machine-specific paths in committed files.
-- Keep the README's "two layers" explanation - it is the part that makes
-  people understand why the tool exists.
+- Keep the README's "two layers" explanation - it is why the tool exists.
